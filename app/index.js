@@ -1,96 +1,118 @@
 require('dotenv').config();
-
 const express = require('express');
 const fileUpload = require('express-fileupload');
 const app = express();
-const uuidv4 = require('uuid/v4');
-var filename = require('file-name');
-const { execFile } = require('child_process');
-var glob = require("glob")
-
-const path = require('path')
+const { v4: uuidv4 } = require('uuid');
+const { exec } = require('child_process');
+const path = require('path');
+const fs = require('fs').promises;
+const cors = require('cors');
 
 const PORT = parseInt(process.env.PORT) || 3000;
 const DATA_DIR = process.env.DATA_DIR || './data';
-const PATH_TO_RUBY_ORIGAMI_GEM_PDFENCRYPT = process.env.PATH_TO_RUBY_ORIGAMI_GEM_PDFENCRYPT;
-// default options
-app.use(fileUpload());
 
-app.use(express.static('public'))
+// Enable CORS for API access
+app.use(cors());
+app.use(fileUpload({
+    limits: { fileSize: 50 * 1024 * 1024 }, // 50MB max
+    useTempFiles: true,
+    tempFileDir: DATA_DIR
+}));
+app.use(express.static('public'));
+app.use(express.json());
 
-app.post('/upload', function (req, res) {
-    var pdfFile = req.files.pdf;
-    var password = req.body.password;
+// Health check endpoint
+app.get('/health', (req, res) => {
+    res.json({ status: 'ok', service: 'pdf-encryption' });
+});
 
-    if (!pdfFile) {
-        var message = 'nie załączyłeś pliku';
-        console.error(message);
-        return res.status(400).send(message);
-    }
-    if (!password) {
-        var message = 'nie nadałeś pliku';
-        console.error(message);
-        return res.status(400).send(message);
-    }
+// Main encryption endpoint
+app.post('/upload', async function (req, res) {
+    let tempPath = null;
+    let encryptedPath = null;
 
-    var tempFile = TempFile(pdfFile.name, DATA_DIR, '.encrypted', '.pdf');
+    try {
+        const pdfFile = req.files?.pdf;
+        const password = req.body?.password;
+        const filename = req.body?.filename;
 
-    pdfFile.mv(tempFile.tempPath, async function (error) {
-        if (error) {
-            console.error(error);
-            return res.status(500).send(error);
+        // Validation
+        if (!pdfFile) {
+            return res.status(400).json({ error: 'No PDF file provided' });
         }
 
-        resolveFilePath(PATH_TO_RUBY_ORIGAMI_GEM_PDFENCRYPT, (error, execFilePath) => { // not sure if necessary
-            if (error) {
-                console.error(error);
-                return res.status(500).send(error);
-            }
+        if (!password) {
+            return res.status(400).json({ error: 'No password provided' });
+        }
 
-            execFile(execFilePath, [tempFile.tempPath, '-p', password, '-o', tempFile.tempConvertedPath], (error, stdout, stderr) => {
+        // Generate unique filenames
+        const uniqueId = uuidv4();
+        tempPath = path.join(DATA_DIR, `${uniqueId}.pdf`);
+        encryptedPath = path.join(DATA_DIR, `${uniqueId}.encrypted.pdf`);
+
+        // Move uploaded file to temp location
+        await pdfFile.mv(tempPath);
+
+        // Use qpdf to encrypt the PDF
+        const qpdfCommand = `qpdf --encrypt "${password}" "${password}" 256 --accessibility=n --extract=n --print=none --modify=none -- "${tempPath}" "${encryptedPath}"`;
+
+        await new Promise((resolve, reject) => {
+            exec(qpdfCommand, (error, stdout, stderr) => {
                 if (error) {
-                    console.error(error);
-                    return res.status(500).send(error);
+                    console.error('qpdf error:', stderr);
+                    reject(new Error(`Encryption failed: ${stderr || error.message}`));
+                } else {
+                    resolve();
                 }
-
-                return res.download(tempFile.tempConvertedPath, tempFile.convertedName);
             });
-        })
-    });
+        });
+
+        // Check if client wants base64 (for API usage) or file download (for web UI)
+        const returnBase64 = req.body?.return_base64 === 'true' || req.headers['accept'] === 'application/json';
+
+        if (returnBase64) {
+            // Return base64 for API clients
+            const encryptedBuffer = await fs.readFile(encryptedPath);
+            const base64Pdf = encryptedBuffer.toString('base64');
+
+            // Cleanup
+            await fs.unlink(tempPath).catch(console.error);
+            await fs.unlink(encryptedPath).catch(console.error);
+
+            return res.json({
+                base64: base64Pdf,
+                filename: filename || pdfFile.name.replace('.pdf', '.encrypted.pdf')
+            });
+        } else {
+            // Return file download for web UI
+            const downloadName = filename || pdfFile.name.replace('.pdf', '.encrypted.pdf');
+            
+            res.download(encryptedPath, downloadName, async (error) => {
+                if (error) {
+                    console.error('Download error:', error);
+                }
+                // Cleanup after download
+                await fs.unlink(tempPath).catch(console.error);
+                await fs.unlink(encryptedPath).catch(console.error);
+            });
+        }
+
+    } catch (error) {
+        console.error('Error:', error);
+
+        // Cleanup on error
+        if (tempPath) await fs.unlink(tempPath).catch(() => {});
+        if (encryptedPath) await fs.unlink(encryptedPath).catch(() => {});
+
+        res.status(500).json({ error: error.message });
+    }
 });
+
+// Redirect GET requests to home
 app.get('/upload', (req, res) => {
     return res.redirect('/');
-})
+});
 
-app.listen(PORT, () => console.log(`App is listening on port ${PORT}!`))
-
-
-function TempFile(originalName, storageDirectory, convertedNameSuffix, extension = '') {
-    var tempName = uuidv4();
-    var tempNameExt = tempName + extension;
-    var tempPath = path.join(storageDirectory, tempNameExt);
-    var tempConvertedPath = path.join(storageDirectory, tempName + convertedNameSuffix + extension);
-    var convertedName = filename(originalName) + convertedNameSuffix + extension;
-
-    return {
-        originalName,
-        tempName,
-        tempPath,
-        tempConvertedPath,
-        convertedName,
-    }
-}
-
-function resolveFilePath(filePath, callback) {
-    glob(filePath, function (error, files) {
-        if (error) {
-            return callback(error);
-        }
-
-        if (files.length <= 0) {
-            return callback('no files found for glob ' + filePath);
-        }
-
-        return callback(null, files[0]);
-    })
-}
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`PDF encryption service running on port ${PORT}`);
+});
