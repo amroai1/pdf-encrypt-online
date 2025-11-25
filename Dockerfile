@@ -1,12 +1,31 @@
-FROM node:10
+FROM node:18-alpine
 
-RUN apt-get update && \
-    apt-get install -y ruby && \
-    gem install origami  && \
-    rm -rf /var/lib/apt/lists/*
+# Install qpdf
+RUN apk add --no-cache qpdf
 
-ENV TINI_VERSION v0.18.0
-ADD https://github.com/krallin/tini/releases/download/${TINI_VERSION}/tini /tini
-RUN chmod +x /tini
-ENTRYPOINT ["/tini", "--"]
+# Install tini for proper signal handling
+RUN apk add --no-cache tini
 
+# Create app directory
+WORKDIR /app
+
+# Create data directory for temp files
+RUN mkdir -p /app/data
+
+# Copy package files
+COPY package*.json ./
+
+# Install dependencies
+RUN npm install --production
+
+# Copy app source
+COPY . .
+
+# Expose port
+EXPOSE 3000
+
+# Use tini as entrypoint for proper signal handling
+ENTRYPOINT ["/sbin/tini", "--"]
+
+# Start the server
+CMD ["npm", "start"]
